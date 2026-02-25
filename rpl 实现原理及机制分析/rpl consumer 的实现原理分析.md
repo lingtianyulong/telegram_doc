@@ -20,7 +20,15 @@ consumer
 - **consumer**：保存“如何处理数据”的逻辑（回调封装）
 - **operator**：返回新的 producer，本质是 producer 的包装
 
-------
+**角色与定位**
+
+在 RPL 的「生产者-消费者」模型里：
+
+- Producer：按需向某个「接收端」推送值/错误/完成，它不直接持有回调，而是接收一个 consumer。
+
+- Consumer：这个「接收端」的抽象。它封装三个回调（next / error / done），并负责生命周期（lifetime）和状态（state）。Producer 的 generator 被调用时，会拿到一个 consumer，通过它把事件推下去。
+
+也就是说：consumer 是订阅端接口 + 回调容器 + 生命周期管理的统一体。
 
 ## 2 consumer 的核心结构
 
@@ -47,6 +55,26 @@ struct consumer {
 
 - 使用模板 + 小对象优化 + 类型擦除
 - 避免虚函数带来的额外开销
+
+`telegram` 中 `consumer` 的核心类型结构，如下：
+
+```c++
+consumer<Value, Error, Handlers>
+    └── 继承 consumer_base<Value, Error, Handlers>
+            └── 持有一个 std::shared_ptr<Handlers> _handlers
+```
+
+- Handlers 默认是 details::type_erased_handlers<Value, Error>（类型擦除的接口）。
+
+- 具体实现是 consumer_handlers<Value, Error, OnNext, OnError, OnDone>，内部保存三个可调用对象：
+
+  - _next：处理下一个值
+
+  - _error：处理错误
+
+  - _done：处理完成
+
+因此，consumer 的「实现」就是：一个 `shared` 的 `handlers` 对象，上面挂着 `next/error/done` 三个回调。
 
 ## 3 consumer 的核心设计思想
 
@@ -181,6 +209,23 @@ producer → static function pointer → lambda
 :warning:不是 std::function
 :warning:没有堆分配（多数情况）
 
+> [!note]
+>
+> **向 Consumer 推送事件的 API（consumer_base）**
+>
+> | 方法                                              | 作用                                                         |
+> | :------------------------------------------------ | :----------------------------------------------------------- |
+> | put_next(Value &&) / put_next_copy(const Value &) | 推送一个「下一个值」，会调用 _next。返回 bool 表示是否还接受（未 terminate 时为 true）。 |
+> | put_error / put_error_copy                        | 推送错误，调用 _error，并终止该 consumer（见下）。           |
+> | put_done()                                        | 推送完成，调用 _done，并终止该 consumer。                    |
+> | put_next_forward / put_error_forward              | 对 move 或 copy 版本的简单转发。                             |
+>
+> 要点：
+>
+> - 单次终止：一旦调用了 put_error 或 put_done，handlers 会 terminate()，之后 _handlers 被置空或失效，再调用 put_* 会直接返回/不做事，避免重复调用或 use-after-free。
+>
+> - put_next 的返回值：上游（如 operator 或 producer 实现）可以根据返回值决定是否继续发、是否要 copy 给多个 consumer 等（例如 event_stream 里对多个 consumer 的 copy/move 策略）。
+
 ## 5 consumer 与 lifetime 的关系
 
 在 Telegram Desktop 中，rpl 强依赖 `lifetime`。
@@ -206,6 +251,33 @@ producer.start_with_next(callback, lifetime);
 这保证：
 
 > 不会出现 Qt 那种悬空回调问题
+
+> [!note]
+>
+> ### 终止与生命周期（terminate / lifetime）
+>
+> - terminate()：
+>
+>   - 在 consumer_base 里：若还有 _handlers，则 take_handlers() 后调用 handlers->terminate()。
+>
+>   - 在 type_erased_handlers::terminate() 里：设 _terminated = true 并 _lifetime.destroy()。
+>
+> 即：终止 = 标记已终止 + 销毁该 consumer 所持有的所有 lifetime（取消订阅、释放 state 等）。
+>
+> - add_lifetime(lifetime &&)：
+>   - 把一段生命周期挂到当前 consumer 的 handlers 上。若已 terminate，则直接 lifetime.destroy() 并返回 false；否则加入 handlers 的 _lifetime，在 terminate() 时一起被 destroy。
+>   - Producer 的 generator 返回的 lifetime 通常就是通过 consumer.add_lifetime(...) 挂上去的，所以取消订阅只要让该 lifetime 被 destroy（或先 terminate consumer）即可。
+>
+> - terminator()：
+>
+>   - 返回一个可调用对象，调用时执行 self.terminate()。常用于「当某个外部 lifetime 结束时，顺带取消这次订阅」，例如：`producer.h` Lines351-352
+>
+>     ```c++
+>     alive_while.add(consumer.terminator());
+>     consumer.add_lifetime(std::move(_generator)(consumer));
+>     ```
+>
+>     即：先把「终止该 consumer」注册到 alive_while 上，再把 generator 返回的 lifetime 交给 consumer；这样只要 alive_while 被 destroy，consumer 会先被 terminate，其上的 lifetime（包括 generator 的）也会被一起清理。
 
 ## 6 consumer 的执行模型
 
@@ -262,6 +334,32 @@ new producer( [upstream] (consumer c) {
 - consumer 被包一层
 - 数据逐层向下传递
 - 所有操作在编译期展开
+
+> [!note]
+>
+> **与 Producer 的衔接（数据流机制）**
+>
+> 1. 用户对 producer 调用 start(next, error, done) 或 start_existing(consumer)。
+>
+> 2. start 内部用 make_consumer(next, error, done) 得到一个 consumer，再调用 start_existing(consumer, lifetime)。
+>
+> 3. start_existing 中：
+>
+>    - 把 consumer.terminator() 加到 alive_while，保证外部生命周期结束时能终止订阅。
+>
+>    - 调用 _generator(consumer)，即 producer 的 lambda，传入当前 consumer。
+>
+> 4. Producer 的 generator 实现（包括各种 | operator 链）会：
+>
+>    - 使用传入的 consumer 调用 put_next / put_error / put_done 向下游推送；
+>
+>    - 需要时用 consumer.add_lifetime(...) 注册子订阅的 lifetime；
+>
+>    - 需要时用 consumer.make_state<...>(...) 在订阅生命周期内保存状态。
+>
+> 5. Generator 返回的 lifetime 被 consumer.add_lifetime(...) 收纳，因此当 consumer 被 terminate（或该 lifetime 被显式 destroy）时，整个订阅链一起结束。
+>
+> 所以：consumer 既是「下游接口」（供 producer/operator 推送事件），又是「订阅生命周期与状态的持有者」。
 
 ## 8 性能来源分析
 
