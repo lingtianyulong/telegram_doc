@@ -203,8 +203,6 @@ C1 XOR C2 = P1 XOR P2
 - 长期运行服务
 - 分布式系统
 
-------
-
 **方案 3：分段结构（工业级常用）**
 
 推荐结构：`nonce = machine_id || timestamp || local_counter`
@@ -258,8 +256,6 @@ C1 XOR C2 = P1 XOR P2
 - 不需要全局状态
 - 支持并行
 
-------
-
 :two: **网络通信（TLS 类场景）**
 
 像 AES-GCM 在 TLS 中：`nonce = fixed_iv XOR sequence_number` 
@@ -270,8 +266,6 @@ sequence_number 是单调递增的。
 
 - 每个包唯一
 - 不需要随机数
-
-------
 
 ### 7.3 绝对不要做的事情
 
